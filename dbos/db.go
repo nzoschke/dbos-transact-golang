@@ -91,6 +91,21 @@ func (p *pgxDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 func (p *pgxDB) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
 func (p *pgxDB) Close()                         { p.pool.Close() }
 
+// ptrTo returns a pointer to v. Useful when calling sqlc-generated functions
+// whose nullable-column parameters are typed as *T, but the caller has a
+// concrete value to pass.
+func ptrTo[T any](v T) *T { return &v }
+
+// nullStrPtr returns nil for the empty string and &s otherwise. Useful for
+// passing optional TEXT columns to sqlc-generated functions where empty string
+// should be stored as NULL.
+func nullStrPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 func toPgxTxOptions(opts TxOptions) pgx.TxOptions {
 	out := pgx.TxOptions{}
 	switch opts.IsolationLevel {
