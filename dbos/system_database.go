@@ -22,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/dbos-inc/dbos-transact-golang/dbos/sqlcgen"
 )
 
 /*******************************/
@@ -110,6 +112,7 @@ type ExportedWorkflow struct {
 }
 
 type sysDB struct {
+	db                            DB
 	pool                          *pgxpool.Pool
 	notificationLoopDone          chan struct{}
 	workflowNotificationsMap      *sync.Map
@@ -119,7 +122,8 @@ type sysDB struct {
 	logger                        *slog.Logger
 	schema                        string
 	launched                      bool
-	isCockroachDB                 bool
+	dialect                       Dialect
+	queries                       *sqlcgen.Queries // sqlc-generated query layer; nil when search_path is not under our control (custom pool)
 }
 
 /*******************************/
@@ -244,7 +248,7 @@ const (
 	_DB_RETRY_INTERVAL               = 1 * time.Second
 )
 
-func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCockroach bool) error {
+func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, dialect Dialect) error {
 
 	// Process the migration SQL with fmt.Sprintf
 	sanitizedSchema := pgx.Identifier{schema}.Sanitize()
@@ -253,8 +257,9 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema,
 		sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
 
-	// If not CockroachDB, merge the listen/notify triggers with the main migration
-	if !isCockroach {
+	// LISTEN/NOTIFY triggers and PL/pgSQL functions are Postgres-only.
+	// CockroachDB uses a polling fallback; SQLite has no triggers of this kind.
+	if dialect == DialectPostgres {
 		migration1ListenNotifySQLProcessed := fmt.Sprintf(migration1ListenNotifySQL,
 			sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema, sanitizedSchema)
 		migration1SQLProcessed = migration1SQLProcessed + "\n" + migration1ListenNotifySQLProcessed
@@ -369,7 +374,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, schema string, isCoc
 
 		// Migration 10 uses a DO block with ALTER TABLE, which CockroachDB does not support.
 		// Run the same logic at the application layer.
-		if migration.version == 10 && isCockroach {
+		if migration.version == 10 && dialect == DialectCockroach {
 			checkPKQuery := `SELECT 1 FROM pg_constraint c
 		JOIN pg_class cl ON c.conrelid = cl.oid
 		JOIN pg_namespace n ON cl.relnamespace = n.oid
@@ -477,13 +482,17 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		// Add acquire timeout to prevent indefinite blocking
 		config.ConnConfig.ConnectTimeout = 10 * time.Second
 
+		if config.ConnConfig.RuntimeParams == nil {
+			config.ConnConfig.RuntimeParams = make(map[string]string)
+		}
 		// Set application_name parameter if provided
 		if inputs.applicationName != "" {
-			if config.ConnConfig.RuntimeParams == nil {
-				config.ConnConfig.RuntimeParams = make(map[string]string)
-			}
 			config.ConnConfig.RuntimeParams["application_name"] = inputs.applicationName
 		}
+		// Pin search_path so unqualified queries (e.g. sqlc-generated) resolve to
+		// the configured schema. Existing queries that already qualify with %s.<schema>
+		// are unaffected.
+		config.ConnConfig.RuntimeParams["search_path"] = databaseSchema
 
 		// Create pool with configuration
 		newPool, err := pgxpool.NewWithConfig(ctx, config)
@@ -521,14 +530,15 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		return nil, fmt.Errorf("failed to acquire connection to detect database type: %v", err)
 	}
 	defer conn.Release()
-	isCockroach := isCockroachDB(ctx, conn.Conn())
-	if isCockroach {
+	dialect := DialectPostgres
+	if isCockroachDB(ctx, conn.Conn()) {
+		dialect = DialectCockroach
 		logger.Info("Detected CockroachDB")
 	}
 
 	// Run migrations
 	if err := retry(ctx, func() error {
-		return runMigrations(ctx, pool, databaseSchema, isCockroach)
+		return runMigrations(ctx, pool, databaseSchema, dialect)
 	}, withRetrierLogger(logger)); err != nil {
 		if customPool == nil {
 			pool.Close()
@@ -550,7 +560,8 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 	workflowEventsMap := &sync.Map{}
 	workflowEventsRepollMap := &sync.Map{}
 
-	return &sysDB{
+	s := &sysDB{
+		db:                            newPgxDB(pool),
 		pool:                          pool,
 		workflowNotificationsMap:      workflowNotificationsMap,
 		workflowNotificationRepollMap: workflowNotificationRepollMap,
@@ -559,18 +570,23 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		notificationLoopDone:          make(chan struct{}),
 		logger:                        logger.With("service", "system_database"),
 		schema:                        databaseSchema,
-		isCockroachDB:                 isCockroach,
-	}, nil
+		dialect:                       dialect,
+	}
+	// Only attach sqlc-generated queries when we control the pool's search_path.
+	// Custom pools may have a different search_path; those paths fall back to
+	// the legacy schema-qualified queries.
+	if customPool == nil {
+		s.queries = sqlcgen.New(pool)
+	}
+	return s, nil
 }
 
 func (s *sysDB) launch(ctx context.Context) {
-	// Start the appropriate notification loop based on database type
-	if s.isCockroachDB {
-		// Start the polling-based notification poller loop (CockroachDB)
-		go s.notificationPollerLoop(ctx)
-	} else {
-		// Otherwise start the LISTEN/NOTIFY-based notification listener loop
+	// Postgres uses LISTEN/NOTIFY; other dialects fall back to polling.
+	if s.dialect == DialectPostgres {
 		go s.notificationListenerLoop(ctx)
+	} else {
+		go s.notificationPollerLoop(ctx)
 	}
 	s.launched = true
 }
@@ -625,7 +641,7 @@ type insertWorkflowResult struct {
 type insertWorkflowStatusDBInput struct {
 	status            WorkflowStatus
 	maxRetries        int
-	tx                pgx.Tx
+	tx                Transaction
 	ownerXID          *string
 	incrementAttempts bool
 }
@@ -867,7 +883,7 @@ type listWorkflowsDBInput struct {
 	sortDesc           bool
 	loadInput          bool
 	loadOutput         bool
-	tx                 pgx.Tx
+	tx                 Transaction
 }
 
 // ListWorkflows retrieves a list of workflows based on the provided filters
@@ -1126,7 +1142,7 @@ type updateWorkflowOutcomeDBInput struct {
 	status     WorkflowStatusType
 	output     *string
 	errStr     string
-	tx         pgx.Tx
+	tx         Transaction
 }
 
 // updateWorkflowOutcome updates the status, output, and error of a workflow
@@ -1152,7 +1168,7 @@ func (s *sysDB) updateWorkflowOutcome(ctx context.Context, input updateWorkflowO
 
 type cancelWorkflowDBInput struct {
 	workflowID string
-	tx         pgx.Tx
+	tx         Transaction
 }
 
 func (s *sysDB) cancelWorkflow(ctx context.Context, input cancelWorkflowDBInput) error {
@@ -1197,7 +1213,7 @@ func (s *sysDB) cancelWorkflow(ctx context.Context, input cancelWorkflowDBInput)
 type deleteWorkflowsDBInput struct {
 	workflowIDs    []string
 	deleteChildren bool
-	tx             pgx.Tx
+	tx             Transaction
 }
 
 func (s *sysDB) deleteWorkflows(ctx context.Context, input deleteWorkflowsDBInput) error {
@@ -1252,7 +1268,7 @@ func (s *sysDB) deleteWorkflows(ctx context.Context, input deleteWorkflowsDBInpu
 
 type getWorkflowChildrenDBInput struct {
 	workflowID string
-	tx         pgx.Tx
+	tx         Transaction
 }
 
 // getWorkflowChildren retrieves all descendant workflows of the given parent workflow
@@ -1377,7 +1393,7 @@ func (s *sysDB) garbageCollectWorkflows(ctx context.Context, input garbageCollec
 type resumeWorkflowsDBInput struct {
 	workflowIDs []string
 	queueName   string
-	tx          pgx.Tx
+	tx          Transaction
 }
 
 // resumeWorkflows re-enqueues the given workflows onto the specified queue (or the internal
@@ -1449,7 +1465,7 @@ type forkWorkflowDBInput struct {
 	startStep          int
 	applicationVersion string
 	queueName          string
-	tx                 pgx.Tx
+	tx                 Transaction
 }
 
 func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) (string, error) {
@@ -1664,7 +1680,7 @@ type recordOperationResultDBInput struct {
 	stepName        string
 	output          *string
 	errStr          *string
-	tx              pgx.Tx
+	tx              Transaction
 	startedAt       time.Time
 	completedAt     time.Time
 	serialization   string
@@ -1715,7 +1731,7 @@ type recordChildWorkflowDBInput struct {
 	childWorkflowID  string
 	stepID           int
 	stepName         string
-	tx               pgx.Tx
+	tx               Transaction
 }
 
 func (s *sysDB) recordChildWorkflow(ctx context.Context, input recordChildWorkflowDBInput) error {
@@ -1760,6 +1776,21 @@ func (s *sysDB) recordChildWorkflow(ctx context.Context, input recordChildWorkfl
 }
 
 func (s *sysDB) checkChildWorkflow(ctx context.Context, workflowID string, functionID int) (*string, error) {
+	if s.queries != nil {
+		childWorkflowID, err := s.queries.CheckChildWorkflow(ctx, sqlcgen.CheckChildWorkflowParams{
+			WorkflowUuid: workflowID,
+			FunctionID:   int32(functionID),
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("failed to check child workflow: %w", err)
+		}
+		return childWorkflowID, nil
+	}
+
+	// Fallback for custom pools where search_path is not controlled by us.
 	query := fmt.Sprintf(`SELECT child_workflow_id
               FROM %s.operation_outputs
               WHERE workflow_uuid = $1 AND function_id = $2`, pgx.Identifier{s.schema}.Sanitize())
@@ -1767,7 +1798,7 @@ func (s *sysDB) checkChildWorkflow(ctx context.Context, workflowID string, funct
 	var childWorkflowID *string
 	err := s.pool.QueryRow(ctx, query, workflowID, functionID).Scan(&childWorkflowID)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to check child workflow: %w", err)
@@ -1790,11 +1821,11 @@ type checkOperationExecutionDBInput struct {
 	workflowID string
 	stepID     int
 	stepName   string
-	tx         pgx.Tx
+	tx         Transaction
 }
 
 func (s *sysDB) checkOperationExecution(ctx context.Context, input checkOperationExecutionDBInput) (*recordedResult, error) {
-	var tx pgx.Tx
+	var tx Transaction
 	var err error
 
 	// Use provided transaction or create a new one
@@ -2330,7 +2361,7 @@ type WorkflowSendInput struct {
 	DestinationID string
 	Message       any
 	Topic         string
-	tx            pgx.Tx
+	tx            Transaction
 	serialization string
 }
 
@@ -2555,7 +2586,7 @@ loop:
 type WorkflowSetEventInput struct {
 	Key           string
 	Message       any
-	tx            pgx.Tx
+	tx            Transaction
 	serialization string
 }
 
@@ -2797,7 +2828,7 @@ func (s *sysDB) getEvent(ctx context.Context, input getEventInput) (*getEventRes
 type writeStreamDBInput struct {
 	Key           string
 	Value         *string // Already serialized
-	tx            pgx.Tx
+	tx            Transaction
 	serialization string
 }
 
@@ -2921,7 +2952,7 @@ func (s *sysDB) readStream(ctx context.Context, input readStreamDBInput) ([]stre
 type setWorkflowDelayDBInput struct {
 	workflowID string
 	delayUntil time.Time
-	tx         pgx.Tx
+	tx         Transaction
 }
 
 // setWorkflowDelay updates the delay on a DELAYED workflow.
@@ -3381,7 +3412,7 @@ type createScheduleDBInput struct {
 	AutomaticBackfill bool
 	CronTimezone      string
 	QueueName         string
-	tx                pgx.Tx // optional: run inside an existing transaction
+	tx                Transaction // optional: run inside an existing transaction
 }
 
 func (s *sysDB) createSchedule(ctx context.Context, input createScheduleDBInput) error {
@@ -3431,7 +3462,7 @@ type listSchedulesDBInput struct {
 	Statuses             []ScheduleStatus
 	WorkflowNames        []string
 	ScheduleNamePrefixes []string
-	tx                   pgx.Tx // optional: run inside an existing transaction
+	tx                   Transaction // optional: run inside an existing transaction
 }
 
 func (s *sysDB) listSchedules(ctx context.Context, input listSchedulesDBInput) ([]WorkflowSchedule, error) {
@@ -3540,7 +3571,7 @@ type updateScheduleDBInput struct {
 	ScheduleName string
 	Status       ScheduleStatus
 	LastFiredAt  *time.Time
-	tx           pgx.Tx // optional: run inside an existing transaction
+	tx           Transaction // optional: run inside an existing transaction
 }
 
 func (s *sysDB) updateSchedule(ctx context.Context, input updateScheduleDBInput) error {
@@ -3582,7 +3613,7 @@ func (s *sysDB) updateScheduleLastFiredAt(ctx context.Context, scheduleName stri
 
 type deleteScheduleDBInput struct {
 	ScheduleName string
-	tx           pgx.Tx // optional: run inside an existing transaction
+	tx           Transaction // optional: run inside an existing transaction
 }
 
 func (s *sysDB) deleteSchedule(ctx context.Context, input deleteScheduleDBInput) error {
